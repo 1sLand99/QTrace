@@ -21,6 +21,7 @@ struct logger{
     std::string logfile;
     int64_t lastwrite;
     int64_t totallen;
+    int fd;
 };
 
 extern logger *_logger;
@@ -29,6 +30,7 @@ void initLogger(size_t function_address);
 void deleteLogger();
 void writelog();
 void appendlog(const char* str);
+void appendlog_n(const char* str, size_t len);
 void appendlogendl();
 void appendformat(const char* format,...);
 

@@ -61,7 +61,46 @@ uintptr_t inline get_current_x30() {
     __asm__ __volatile__("mov %0, x30" : "=r"(reg));
     return reg;
 }
+// pending:暂存上一条指令待补全的信息
+struct PendingInst {
+    bool valid = false;
+    char line[256];
+    int  lineLen = 0;
+    int  writeRegs[8];
+    const char* writeNames[8];
+    int  numWrite = 0;
+    char memInfo[1024];      // 内存访问行(可能多条)
+    int  memLen = 0;
+};
 
+static PendingInst pending;
+
+// 把 pending(上一条指令)用当前寄存器状态补全并输出
+static void flushPending(QBDI::GPRState *gprState)
+{
+    if (!pending.valid) return;
+
+    appendlog_n(pending.line, pending.lineLen);   // 上一条的 "asm [读]"
+
+    if (pending.numWrite > 0) {
+        char wbuf[256];
+        int woff = 0;
+        for (int i = 0; i < pending.numWrite; ++i) {
+            uint64_t v = QBDI_GPR_GET(gprState, pending.writeRegs[i]);  // 此刻 = 上一条执行后的值
+            woff += snprintf(wbuf + woff, sizeof(wbuf) - woff, "%s=0x%" PRIx64 " ",
+                             pending.writeNames[i], v);
+            if (woff >= (int)sizeof(wbuf)) { woff = sizeof(wbuf) - 1; break; }
+        }
+        appendlog("\t => [");
+        appendlog_n(wbuf, woff);
+        appendlog("]");
+    }
+    appendlogendl();
+    if (pending.memLen > 0) {
+        appendlog_n(pending.memInfo, pending.memLen);
+    }
+    pending.valid = false;
+}
 static void save_regs(size_t* regs)
 {
     regs[0] = get_current_x0();
@@ -119,6 +158,7 @@ size_t trace(size_t regs[31])
     LOGE("trace begin");
     bool qbdi_success = qvm.call(&qbdi_retval, (uint64_t)function_address);
     LOGE("trace end");
+    flushPending(qbdi_state);
     if (qbdi_success) {
         writelog();
         LOGE("trace completed successfully %s",_logger->logfile.c_str());
@@ -211,16 +251,34 @@ bool checkJniCall_pre(QBDI::VM *vm, QBDI::GPRState *gprState,size_t target)
 }
 
 static size_t lastAddr = 0;
+
+static unordered_map<uint32_t,char*> disassemblecache;
+
 // 显示指令执行前的寄存器状态
 QBDI::VMAction showPreInstruction(QBDI::VM *vm, QBDI::GPRState *gprState, QBDI::FPRState *fprState, void *data)
 {
     auto thiz = (class vm *)data;
+
+    //上一条指令的信息全部拿到了，写入
+    flushPending(gprState);
+
     // 获取当前指令的分析信息
-    const QBDI::InstAnalysis *instAnalysis = vm->getInstAnalysis(QBDI::ANALYSIS_INSTRUCTION | QBDI::ANALYSIS_DISASSEMBLY | QBDI::ANALYSIS_OPERANDS);
-    appendlog("0x");
-    appendformat("%lx",(instAnalysis->address-thiz->base));
-    appendlog(": ");
-    appendlog(instAnalysis->disassembly);
+    const QBDI::InstAnalysis *instAnalysis = vm->getInstAnalysis(QBDI::ANALYSIS_INSTRUCTION  | QBDI::ANALYSIS_OPERANDS);
+    uint32_t bytecode = *(uint32_t*)instAnalysis->address;
+
+    //用缓存的反汇编，减低开销
+    char* disasm;
+    auto it = disassemblecache.find(bytecode);
+    if (it != disassemblecache.end()) {
+        disasm = it->second;
+    } else {
+        const QBDI::InstAnalysis *full = vm->getInstAnalysis(QBDI::ANALYSIS_DISASSEMBLY);
+        size_t len = strlen(full->disassembly) + 1;
+        disasm = (char*)malloc(len);
+        memcpy(disasm, full->disassembly, len);
+        disassemblecache.emplace(bytecode, disasm);
+    }
+
     bool hasCheck = false;
     //执行前hook
     hasCheck = checkAndCallHook(vm,gprState,(instAnalysis->address-thiz->base),(lastAddr - thiz->base));
@@ -228,7 +286,7 @@ QBDI::VMAction showPreInstruction(QBDI::VM *vm, QBDI::GPRState *gprState, QBDI::
     if(!hasCheck)
     {
         //检查blr
-        if(strstr(instAnalysis->disassembly,"blr"))
+        if(instAnalysis->isCall && !strcmp(instAnalysis->mnemonic,"BLR"))
         {
             for (int i = 0; i < instAnalysis->numOperands; ++i)
             {
@@ -249,7 +307,7 @@ QBDI::VMAction showPreInstruction(QBDI::VM *vm, QBDI::GPRState *gprState, QBDI::
     if(!hasCheck)
     {
         //检查br
-        if(strstr(instAnalysis->disassembly,"br") && hasLibctrace())
+        if(instAnalysis->isBranch && !strcmp(instAnalysis->mnemonic,"BR") && hasLibctrace())
         {
             for (int i = 0; i < instAnalysis->numOperands; ++i)
             {
@@ -271,33 +329,55 @@ QBDI::VMAction showPreInstruction(QBDI::VM *vm, QBDI::GPRState *gprState, QBDI::
         }
     }
 
-    std::stringstream output;
-    // 遍历操作数并记录读取的寄存器状态
+    int off = 0;
+    off += snprintf(pending.line + off, sizeof(pending.line) - off,
+                    "0x%lx: %s", (instAnalysis->address - thiz->base), disasm);
+
+    char rbuf[256];
+    int roff = 0;
+    bool any = false;
     for (int i = 0; i < instAnalysis->numOperands; ++i)
     {
-        auto op = instAnalysis->operands[i];
-        if (op.regAccess == QBDI::REGISTER_READ || op.regAccess == REGISTER_READ_WRITE)
+        auto& op = instAnalysis->operands[i];
+        if ((op.regAccess == QBDI::REGISTER_READ || op.regAccess == REGISTER_READ_WRITE)
+            && op.regCtxIdx != -1 && op.type == OPERAND_GPR)
         {
-            if (op.regCtxIdx != -1 && op.type == OPERAND_GPR)
-            {
-                uint64_t regValue = QBDI_GPR_GET(gprState, op.regCtxIdx);
-                // 将寄存器名称和值添加到输出流
-                output << op.regName << "=0x" << std::hex << regValue << " ";
-                output.flush();
+            uint64_t regValue = QBDI_GPR_GET(gprState, op.regCtxIdx);
+            roff += snprintf(rbuf + roff, sizeof(rbuf) - roff, "%s=0x%" PRIx64 " ",
+                             op.regName, regValue);
+            any = true;
+            if (roff >= (int)sizeof(rbuf)) { roff = sizeof(rbuf) - 1; break; }
+        }
+    }
+    if (any) {
+        off += snprintf(pending.line + off, sizeof(pending.line) - off, "\t[");
+        // 把读寄存器拼进 pending.line
+        int copyLen = roff;
+        if (off + copyLen >= (int)sizeof(pending.line)) copyLen = sizeof(pending.line) - off - 2;
+        if (copyLen > 0) { memcpy(pending.line + off, rbuf, copyLen); off += copyLen; }
+        off += snprintf(pending.line + off, sizeof(pending.line) - off, "]");
+    }
+
+    pending.lineLen = off;
+
+    // ④ 记录当前指令会写哪些寄存器,等下一条 PRE 来补值
+    pending.numWrite = 0;
+    for (int i = 0; i < instAnalysis->numOperands; ++i)
+    {
+        auto& op = instAnalysis->operands[i];
+        if ((op.regAccess == REGISTER_WRITE || op.regAccess == REGISTER_READ_WRITE)
+            && op.regCtxIdx != -1 && op.type == OPERAND_GPR)
+        {
+            if (pending.numWrite < 8) {
+                pending.writeRegs[pending.numWrite]  = op.regCtxIdx;
+                pending.writeNames[pending.numWrite] = op.regName;
+                pending.numWrite++;
             }
         }
     }
-    // 如果有读取的寄存器信息，格式化输出
-    if (!output.str().empty())
-    {
-        appendlog("\t[");
-        appendlog(output.str().c_str());
-        appendlog("]");
-        if(debugInsn)
-        {
-            LOGE("trace:0x%lx:%s [%s]",(instAnalysis->address-thiz->base) ,instAnalysis->disassembly,output.str().c_str());
-        }
-    }
+    pending.memLen = 0;
+    pending.valid = true;
+
     if(sdslen(_logger->buf) > bufsize)
     {
         writelog();
@@ -312,7 +392,7 @@ QBDI::VMAction showPostInstruction(QBDI::VM *vm, QBDI::GPRState *gprState, QBDI:
     auto thiz = (class vm *)data;
 
     // 获取当前指令的分析信息，包括指令、符号、操作数等
-    const QBDI::InstAnalysis *instAnalysis = vm->getInstAnalysis(QBDI::ANALYSIS_INSTRUCTION | QBDI::ANALYSIS_DISASSEMBLY | QBDI::ANALYSIS_OPERANDS);
+    const QBDI::InstAnalysis *instAnalysis = vm->getInstAnalysis(QBDI::ANALYSIS_INSTRUCTION | QBDI::ANALYSIS_OPERANDS);
 
     std::stringstream output;
     std::stringstream regOutput;
@@ -352,33 +432,23 @@ QBDI::VMAction showPostInstruction(QBDI::VM *vm, QBDI::GPRState *gprState, QBDI:
 
 QBDI::VMAction showMemoryAccess(QBDI::VM *vm, QBDI::GPRState *gprState, QBDI::FPRState *fprState, void *data)
 {
-    auto thiz = (class vm *)data;
-    if (vm->getInstMemoryAccess().empty())
+    const auto& accesses = vm->getInstMemoryAccess();   // 只调一次
+    for (const auto &acc : accesses)
     {
-        appendlogendl();
-    }
-    for (const auto &acc : vm->getInstMemoryAccess())
-    {
-        std::ostringstream logStream;
-
-        if (acc.type == MEMORY_READ)
-        {
-            logStream << "mem[r]: 0x" << std::hex << acc.accessAddress << " size: " << acc.size
-                      << " value: 0x" << acc.value;
+        const char* tag = (acc.type == MEMORY_READ)  ? "mem[r]"
+                                                     : (acc.type == MEMORY_WRITE) ? "mem[w]"
+                                                                                  : "mem[rw]";
+        pending.memLen += snprintf(pending.memInfo + pending.memLen,
+                                   sizeof(pending.memInfo) - pending.memLen,
+                                   "%s: 0x%" PRIx64 " size: %u value: 0x%" PRIx64 "\n",
+                                   tag,
+                                   (uint64_t)acc.accessAddress,
+                                   (unsigned)acc.size,
+                                   (uint64_t)acc.value);
+        if (pending.memLen >= (int)sizeof(pending.memInfo)) {
+            pending.memLen = sizeof(pending.memInfo) - 1;
+            break;
         }
-        else if (acc.type == MEMORY_WRITE)
-        {
-            logStream << "mem[w]: 0x" << std::hex << acc.accessAddress << " size: " << acc.size
-                      << " value: 0x" << acc.value;
-        }
-        else
-        { // MEMORY_READ_WRITE
-            logStream << "mem[rw]: 0x" << std::hex << acc.accessAddress << " size: " << acc.size
-                      << " value: 0x" << acc.value;
-        }
-        // 输出日志
-        appendlog(logStream.str().c_str());
-        appendlogendl();
     }
     return QBDI::VMAction::CONTINUE;
 }
@@ -408,8 +478,8 @@ QBDI::VM vm::init(size_t start,size_t end)
     assert(cid != QBDI::INVALID_EVENTID);
 
     //指令后hook
-    cid = qvm.addCodeCB(QBDI::POSTINST, showPostInstruction, this);
-    assert(cid != QBDI::INVALID_EVENTID);
+    //cid = qvm.addCodeCB(QBDI::POSTINST, showPostInstruction, this);
+    //assert(cid != QBDI::INVALID_EVENTID);
 
     //TODO:syscall trace
     //cid = qvm.addCodeCB(QBDI::PREINST, showSyscall, this);
