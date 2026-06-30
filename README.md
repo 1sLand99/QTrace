@@ -23,3 +23,6 @@
 5.Build-Generate Apks,将自动生成libnativelib.so ,将其 push 到 /data/local/tmp目录下
 
 6.使用第三方工具注入libnativelib.so 到目标进程，可使用项目自带的frida脚本inject.js
+
+# 使用教程
+[QTrace：基于QBDI的高稳定，高定制的trace工具](https://bbs.kanxue.com/thread-290574.htm)
